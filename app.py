@@ -233,24 +233,34 @@ import pandas as pd
 
 def positions_view(data, prices_df=None):
     """
-    Positions view:
-      - Uses a Groups file (Sequence, Groups, Name) to cluster & order clients.
-      - Creates ONE sheet per group.
-      - Layout per sheet (columns A–D):
-          Item | Value/Qty | Weight | MV
-          Group, Name, NAV, Total Cash, Stocks header, stock rows, Momentum, blank
-      - For each stock row:
-          MV     (col D) = Qty * Price (via VLOOKUP from group summary)
-          Weight (col C) = MV / NAV
-      - Group summary in columns H:...:
-          H1: "Group Summary"
-          Totals (Cash, NAV) in H2:I3
-          H5:L..: Stock, Sum Qty, Sum MV, Weight, Price
-      - Streamlit preview shows the combined rows exactly as written (all groups stacked).
+    Positions view grouped into separate sheets.
+
+    - Accepts optional Groups mapping (Sequence, Groups, Name).
+    - If no groups file, everyone is in 'Ungrouped'.
+    - Each group -> its own sheet.
+    - Sheet layout (A:D):
+        Item | Value/Qty | Weight | MV
+        Group, Name, NAV, Total Cash, Stocks header,
+        Stock rows, Momentum, blank line
+    - Group summary in H:L:
+        H1: 'Group Summary'
+        H2: Total Cash
+        H3: Total NAV
+        H5:L..: Stock, Sum Qty, Sum MV, Weight, Price
+    - For each stock row in A:D:
+        MV (col D)     = Qty * Price (via VLOOKUP to summary Price col)
+        Weight (col C) = MV / NAV
+    - Streamlit preview mimics the row structure (all groups stacked).
     """
+
     st.subheader("Positions View (Per-Group Sheets + Summary + Formulas)")
 
-    # ---------- 0) Groups mapping upload ----------
+    # If no client data, just bail safely
+    if not data:
+        st.info("No client data found. Please upload your main Excel file first.")
+        return
+
+    # ---------- 0) Optional Groups mapping upload ----------
     grp_file = st.file_uploader(
         "Upload Groups mapping (columns: Sequence, Groups, Name) — optional",
         type=["xlsx", "csv"],
@@ -266,27 +276,27 @@ def positions_view(data, prices_df=None):
 
     if grp_file is not None:
         try:
-            gdf = (
-                pd.read_csv(grp_file)
-                if grp_file.name.lower().endswith(".csv")
-                else pd.read_excel(grp_file)
-            )
+            if grp_file.name.lower().endswith(".csv"):
+                gdf = pd.read_csv(grp_file)
+            else:
+                gdf = pd.read_excel(grp_file)
+
+            # Robust column mapping
             colmap = {c.lower().strip(): c for c in gdf.columns}
             name_col = colmap.get("name")
-            seq_col = colmap.get("sequence")
-            grp_col = colmap.get("groups") or colmap.get("group")
+            seq_col  = colmap.get("sequence")
+            grp_col  = colmap.get("groups") or colmap.get("group")
 
             if not name_col:
                 st.error("Groups file must contain a 'Name' column.")
                 return
 
-            gdf = gdf.rename(
-                columns={
-                    name_col: "Name",
-                    (seq_col if seq_col else "Sequence"): "Sequence",
-                    (grp_col if grp_col else "Groups"): "Groups",
-                }
-            )
+            gdf = gdf.rename(columns={
+                name_col: "Name",
+                (seq_col if seq_col else "Sequence"): "Sequence",
+                (grp_col if grp_col else "Groups"): "Groups",
+            })
+
             gdf["Name"] = gdf["Name"].map(_norm_name)
             if "Groups" not in gdf.columns:
                 gdf["Groups"] = "Ungrouped"
@@ -296,63 +306,59 @@ def positions_view(data, prices_df=None):
 
             clients_df["Name"] = clients_df["Name"].map(_norm_name)
             merged = clients_df.merge(
-                gdf[["Name", "Groups", "Sequence"]], on="Name", how="left"
+                gdf[["Name", "Groups", "Sequence"]],
+                on="Name",
+                how="left"
             )
             merged["Groups"] = merged["Groups"].fillna("Ungrouped")
             merged["SeqSort"] = merged["Sequence"].fillna(10**9)
-            grouped_meta = (
-                merged.sort_values(["Groups", "SeqSort", "Name"])
-                .reset_index(drop=True)
-            )
+            grouped_meta = merged.sort_values(
+                ["Groups", "SeqSort", "Name"]
+            ).reset_index(drop=True)
         except Exception as e:
-            st.warning(f"Could not read groups file: {e}")
+            st.warning(f"Could not read groups file, using default grouping. Details: {e}")
 
-        if grouped_meta is None:
-            grouped_meta = clients_df.copy()
-            grouped_meta["Groups"] = "Ungrouped"
-            grouped_meta["SeqSort"] = 0
-
-    if "Sequence" not in grouped_meta.columns:
+    # Fallback if no groups file or it failed
+    if grouped_meta is None or grouped_meta.empty:
+        grouped_meta = clients_df.copy()
+        grouped_meta["Groups"] = "Ungrouped"
+        grouped_meta["SeqSort"] = 0
         grouped_meta["Sequence"] = None
 
-    st.write("**Planned group order:**")
-    preview_cols = [c for c in ["Groups","Name","Sequence"] if c in grouped_meta.columns]
-    st.dataframe(
-        grouped_meta[preview_cols],
-        hide_index=True,
-        use_container_width=True,
-    )
+    # Small text note instead of fragile preview
+    st.write("Groups detected (if no file uploaded, everyone is in 'Ungrouped').")
 
+    # ---------- Price map from prices_df (if provided) ----------
+    price_map = {}
+    if isinstance(prices_df, pd.DataFrame) and not prices_df.empty:
+        if "Stock" in prices_df.columns and "Price" in prices_df.columns:
+            price_map = dict(zip(prices_df["Stock"], prices_df["Price"]))
+
+    # ---------- Utilities ----------
     def sanitize_sheet_name(s: str) -> str:
         s = re.sub(r'[:\\/?*\[\]]', "-", str(s)).strip()
         return (s or "Group")[:31]
 
-    # Pre-build a price map from prices_df if provided
-    price_map = {}
-    if prices_df is not None and not prices_df.empty:
-        if "Stock" in prices_df.columns and "Price" in prices_df.columns:
-            price_map = dict(zip(prices_df["Stock"], prices_df["Price"]))
-
-    # Fills
-    blue_fill = XLFill(start_color="A7C6ED", end_color="A7C6ED", fill_type="solid")
-    gblue_fill = XLFill(start_color="8FB7EA", end_color="8FB7EA", fill_type="solid")
+    # Fills for styling
+    blue_fill  = XLFill(start_color="A7C6ED", end_color="A7C6ED", fill_type="solid")  # Name row
+    gblue_fill = XLFill(start_color="8FB7EA", end_color="8FB7EA", fill_type="solid")  # Group header
     light_grey = XLFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
-    dark_grey = XLFill(start_color="BFBFBF", end_color="BFBFBF", fill_type="solid")
+    dark_grey  = XLFill(start_color="BFBFBF", end_color="BFBFBF", fill_type="solid")
 
-    # ---------- Build preview & workbook ----------
-    all_preview_rows = []  # for Streamlit preview (all groups stacked)
-    preview_header = ["Item", "Value/Qty", "Weight", "MV"]
+    # We'll collect all rows across groups for a preview
+    all_preview_rows = []
+    header = ["Item", "Value/Qty", "Weight", "MV"]
 
+    # ---------- Build workbook ----------
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         created_any_sheet = False
 
         for grp_name, sub in grouped_meta.groupby("Groups", sort=False):
-            # Filter clients that exist in data
+            # Keep only clients that exist in data
             sub_valid = sub[sub["Name"].isin(data.keys())].copy()
-
             if sub_valid.empty:
-                # create minimal placeholder sheet
+                # Placeholder sheet to keep workbook valid
                 sheet_name = sanitize_sheet_name(grp_name)
                 base, idx = sheet_name, 1
                 while sheet_name in writer.book.sheetnames:
@@ -360,93 +366,80 @@ def positions_view(data, prices_df=None):
                     idx += 1
                 pd.DataFrame(
                     [["Group", grp_name, None, None]],
-                    columns=preview_header,
+                    columns=header,
                 ).to_excel(writer, index=False, sheet_name=sheet_name)
                 created_any_sheet = True
                 continue
 
-            # ----- Build rows + block markers (per client) -----
             rows = []
-            block_markers = []  # list of dict(nav_row, first_stock_row, last_stock_row)
-            current_row = 2  # Excel data row (1 is header)
+            block_markers = []  # list of dict with DF indices (not Excel rows)
 
-            for _, r in sub_valid.iterrows():
-                client = r["Name"]
-                info = data[client]
+            for _, row in sub_valid.iterrows():
+                client = row["Name"]
+                info   = data[client]
 
-                # Group label row
+                # Group row
                 rows.append(["Group", grp_name, None, None])
-                current_row += 1  # this row will be at Excel row current_row-1? Wait: we add header later; easier: we will recalc below
-                # Actually simpler: we don't use this row for formulas so no marker needed.
 
                 # Name row
-                name_excel_row = current_row
+                name_idx = len(rows)
                 rows.append(["Name", client, None, None])
-                current_row += 1
 
                 # NAV row
-                nav_excel_row = current_row
+                nav_idx = len(rows)
                 nav_val = float(info.get("aum", 0) or 0)
                 rows.append(["NAV", nav_val, None, None])
-                current_row += 1
 
                 # Total Cash row
                 total_cash = float(info.get("total_cash", 0) or 0)
                 rows.append(["Total Cash", total_cash, None, None])
-                current_row += 1
 
                 # Stocks header row
                 rows.append(["Stocks", "Quantity", "Weight", "MV"])
-                current_row += 1
+                stocks_header_idx = len(rows) - 1
 
-                # stock lines
+                # Stock rows
                 df = info["data"]
-                first_stock_row = current_row
+                first_stock_idx = len(rows)  # index of first stock row (if any)
                 stock_count = 0
                 if not df.empty:
                     for _, srow in df.iterrows():
                         stock = srow.get("Company Name")
-                        qty = float(srow.get("Quantity", 0) or 0)
-                        # leave Weight & MV to formulas
+                        qty   = float(srow.get("Quantity", 0) or 0)
                         rows.append([stock, qty, None, None])
                         stock_count += 1
-                        current_row += 1
-                last_stock_row = (
-                    first_stock_row + stock_count - 1 if stock_count > 0 else None
-                )
+                last_stock_idx = first_stock_idx + stock_count - 1 if stock_count > 0 else None
 
                 # Momentum row
                 rows.append(["Momentum", float(info.get("momentum_mv", 0) or 0), None, None])
-                current_row += 1
 
-                # spacer
+                # Spacer row
                 rows.append(["", "", "", ""])
-                current_row += 1
 
-                block_markers.append(
-                    {
-                        "nav_row": nav_excel_row,
-                        "first_stock_row": first_stock_row,
-                        "last_stock_row": last_stock_row,
-                    }
-                )
+                block_markers.append({
+                    "nav_idx": nav_idx,
+                    "first_stock_idx": first_stock_idx,
+                    "last_stock_idx": last_stock_idx,
+                })
 
-            # For preview: accumulate these rows with group separation
+            # Add these rows to global preview
             all_preview_rows.extend(rows + [["", "", "", ""]])
 
-            # Write this group sheet
+            # DataFrame for this group (no separate header row yet)
+            grp_df = pd.DataFrame(rows, columns=header)
+
+            # Write group sheet: header=True so row 1 is header, data starts at row 2
             sheet_name = sanitize_sheet_name(grp_name)
             base, idx = sheet_name, 1
             while sheet_name in writer.book.sheetnames:
                 sheet_name = sanitize_sheet_name(f"{base}-{idx}")
                 idx += 1
 
-            grp_df = pd.DataFrame(rows, columns=preview_header)
             grp_df.to_excel(writer, index=False, sheet_name=sheet_name, startrow=0, startcol=0)
             ws = writer.sheets[sheet_name]
             created_any_sheet = True
 
-            # ---------- Group summary (H:...) ----------
+            # ---------- Group summary in H:L ----------
             group_clients = sub_valid["Name"].tolist()
             total_nav = sum(float(data[n].get("aum", 0) or 0) for n in group_clients)
             total_cash_sum = sum(float(data[n].get("total_cash", 0) or 0) for n in group_clients)
@@ -456,43 +449,36 @@ def positions_view(data, prices_df=None):
                 dfc = data[n]["data"]
                 if not dfc.empty:
                     for _, srow in dfc.iterrows():
-                        stocks_rows.append(
-                            {
-                                "Stock": srow.get("Company Name"),
-                                "Qty": float(srow.get("Quantity", 0) or 0),
-                                "Price": float(srow.get("Price", 0) or 0),
-                                "MV": float(srow.get("Market Value", 0) or 0),
-                            }
-                        )
+                        stocks_rows.append({
+                            "Stock": srow.get("Company Name"),
+                            "Qty": float(srow.get("Quantity", 0) or 0),
+                            "Price": float(srow.get("Price", 0) or 0),
+                            "MV": float(srow.get("Market Value", 0) or 0),
+                        })
 
             sum_df = pd.DataFrame(stocks_rows)
             if not sum_df.empty:
-                # prefer MV from Qty * Price if price is nonzero
-                sum_df["MV_calc"] = sum_df.apply(
-                    lambda row: (row["Qty"] * row["Price"])
-                    if row["Price"]
-                    else row["MV"],
-                    axis=1,
-                )
+                # Prefer MV from Qty * Price when Price is non-zero
+                def _mv_calc(r):
+                    return r["Qty"] * r["Price"] if r["Price"] else r["MV"]
+
+                sum_df["MV_calc"] = sum_df.apply(_mv_calc, axis=1)
                 gsum = sum_df.groupby("Stock", as_index=False).agg(
-                    **{"Sum Qty": ("Qty", "sum"), "Sum MV": ("MV_calc", "sum")}
+                    **{"Sum Qty": ("Qty", "sum"),
+                       "Sum MV":  ("MV_calc", "sum")}
                 )
-                # group weight
                 gsum["Weight"] = gsum["Sum MV"].div(total_nav).fillna(0.0)
-                # attach Price: from price_map if available, else implied Sum MV / Sum Qty
                 if price_map:
                     gsum["Price"] = gsum["Stock"].map(price_map)
                 else:
                     gsum["Price"] = gsum.apply(
-                        lambda row: (row["Sum MV"] / row["Sum Qty"])
-                        if row["Sum Qty"]
-                        else None,
-                        axis=1,
+                        lambda r: (r["Sum MV"] / r["Sum Qty"]) if r["Sum Qty"] else None,
+                        axis=1
                     )
             else:
                 gsum = pd.DataFrame(columns=["Stock", "Sum Qty", "Sum MV", "Weight", "Price"])
 
-            # write summary
+            # Totals header
             ws.cell(row=1, column=8, value="Group Summary")  # H1
             ws.cell(row=2, column=8, value="Total Cash")
             ws.cell(row=2, column=9, value=total_cash_sum)
@@ -501,35 +487,37 @@ def positions_view(data, prices_df=None):
             ws["I2"].number_format = "#,##0.00"
             ws["I3"].number_format = "#,##0.00"
 
+            # Per-stock summary starting row
             start_r = 5
-            headers = ["Stock", "Sum Qty", "Sum MV", "Weight", "Price"]
-            for j, h in enumerate(headers, start=8):  # H..L
+            headers_sum = ["Stock", "Sum Qty", "Sum MV", "Weight", "Price"]
+            for j, h in enumerate(headers_sum, start=8):  # H..L
                 ws.cell(row=start_r, column=j, value=h)
 
-            for i, row in gsum.iterrows():
+            for i, row_sum in gsum.iterrows():
                 rr = start_r + 1 + i
-                ws.cell(row=rr, column=8, value=row["Stock"])
-                ws.cell(row=rr, column=9, value=row["Sum Qty"])
-                ws.cell(row=rr, column=10, value=row["Sum MV"])
-                ws.cell(row=rr, column=11, value=row["Weight"])
-                ws.cell(row=rr, column=12, value=row["Price"])
+                ws.cell(row=rr, column=8, value=row_sum["Stock"])
+                ws.cell(row=rr, column=9, value=row_sum["Sum Qty"])
+                ws.cell(row=rr, column=10, value=row_sum["Sum MV"])
+                ws.cell(row=rr, column=11, value=row_sum["Weight"])
+                ws.cell(row=rr, column=12, value=row_sum["Price"])
 
-                ws[f"I{rr}"].number_format = "#,##0"      # Sum Qty
-                ws[f"J{rr}"].number_format = "#,##0.00"   # Sum MV
-                ws[f"K{rr}"].number_format = "0.00%"      # Weight
-                ws[f"L{rr}"].number_format = "#,##0.00"   # Price
+                ws[f"I{rr}"].number_format = "#,##0"
+                ws[f"J{rr}"].number_format = "#,##0.00"
+                ws[f"K{rr}"].number_format = "0.00%"
+                ws[f"L{rr}"].number_format = "#,##0.00"
 
-            # price lookup range for formulas (stock vs price)
+            # Price range for formulas (H..L, rows with stock data)
             if not gsum.empty:
                 price_start = start_r + 1
-                price_end = start_r + len(gsum)
-                # H..L, but for VLOOKUP we really just need Stock (H) + Price (L) in same range
+                price_end   = start_r + len(gsum)
+                # Stock is col 1 in this block (H), Price is col 5 (L)
                 price_range = f"$H${price_start}:$L${price_end}"
             else:
                 price_range = None
 
             # ---------- Number formats for main table ----------
-            for cidx in range(2, 5):  # B=Value/Qty, C=Weight, D=MV
+            # B=Value/Qty, C=Weight, D=MV
+            for cidx in range(2, 5):
                 for r in range(2, ws.max_row + 1):
                     cell = ws.cell(row=r, column=cidx)
                     if isinstance(cell.value, (int, float)):
@@ -541,34 +529,39 @@ def positions_view(data, prices_df=None):
                             else:
                                 cell.number_format = "#,##0.00"
 
-            # ---------- Apply formulas for MV & Weight ----------
-            if price_range:
+            # ---------- Add formulas for MV & Weight ----------
+            if price_range and total_nav:
                 for bm in block_markers:
-                    nav_row = bm["nav_row"]
-                    f_s = bm["first_stock_row"]
-                    l_s = bm["last_stock_row"]
-                    if not l_s:
+                    nav_idx = bm["nav_idx"]
+                    f_s     = bm["first_stock_idx"]
+                    l_s     = bm["last_stock_idx"]
+                    if l_s is None:
                         continue
-                    nav_val_cell = ws.cell(row=nav_row, column=2)  # NAV value in col B
 
-                    for r in range(f_s, l_s + 1):
-                        stock_cell = ws.cell(row=r, column=1)   # A
-                        qty_cell = ws.cell(row=r, column=2)     # B
-                        wt_cell = ws.cell(row=r, column=3)      # C
-                        mv_cell = ws.cell(row=r, column=4)      # D
+                    nav_row = nav_idx + 2           # DF index -> Excel row
+                    nav_val_cell = ws.cell(row=nav_row, column=2)  # B{nav_row}
 
+                    for df_i in range(f_s, l_s + 1):
+                        excel_row = df_i + 2        # DF index -> Excel row
+                        stock_cell = ws.cell(row=excel_row, column=1)  # A
+                        qty_cell   = ws.cell(row=excel_row, column=2)  # B
+                        wt_cell    = ws.cell(row=excel_row, column=3)  # C
+                        mv_cell    = ws.cell(row=excel_row, column=4)  # D
+
+                        # MV = Qty * Price (Price is 5th column in H..L range)
                         mv_cell.value = (
                             f'=IFERROR({qty_cell.coordinate}*'
                             f'VLOOKUP({stock_cell.coordinate},{price_range},5,FALSE),0)'
                         )
                         mv_cell.number_format = "#,##0.00"
 
+                        # Weight = MV / NAV
                         wt_cell.value = (
                             f'=IFERROR({mv_cell.coordinate}/{nav_val_cell.coordinate},0)'
                         )
                         wt_cell.number_format = "0.00%"
 
-            # ---------- Styling: group/name/alternating rows ----------
+            # ---------- Styling: Group / Name / alternating rows ----------
             toggle = True
             for r in range(2, ws.max_row + 1):
                 label = (ws.cell(row=r, column=1).value or "").strip().lower()
@@ -587,7 +580,7 @@ def positions_view(data, prices_df=None):
                         ws.cell(row=r, column=c).fill = fill
                     toggle = not toggle
 
-        # if for some reason no sheet got written
+        # safety: if nothing was created, add a simple Summary sheet
         if not created_any_sheet:
             pd.DataFrame(
                 [["No data", "No matching clients in groups file"]],
@@ -602,15 +595,13 @@ def positions_view(data, prices_df=None):
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-    # ---------- Streamlit preview mimicking layout ----------
+    # ---------- Streamlit preview (mimics Excel rows) ----------
     if all_preview_rows:
-        preview_df = pd.DataFrame(all_preview_rows, columns=preview_header)
+        preview_df = pd.DataFrame(all_preview_rows, columns=header)
         st.caption("Preview (structure matches Excel sheets):")
         st.dataframe(preview_df, hide_index=True, use_container_width=True)
     else:
-        st.info("No rows to preview (no matching clients).")
-
-
+        st.info("No rows to preview.")
 
 
 
@@ -637,5 +628,7 @@ else:
         total_portfolio_view_weights(data)
     else:
         positions_view(data,prices_df)
+
+
 
 
