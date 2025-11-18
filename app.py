@@ -619,13 +619,15 @@ if uploaded:
 
     view = st.selectbox(
         "Select View",
-        ["Client View", "Total Portfolio View", "Stock Prices View", "Positions View"]
+        ["Client View", "Total Portfolio View", "Total Portfolio View (Weights)", "Stock Prices View", "Positions View"]
     )
 
     if view == "Client View":
         client_view(data)
     elif view == "Total Portfolio View":
         total_portfolio_view(data)
+    elif view == "Total Portfolio View (Weights)":
+        total_portfolio_view_weights(data)
     elif view == "Stock Prices View":
         stock_prices_view(prices_df)
     elif view == "Positions View":
