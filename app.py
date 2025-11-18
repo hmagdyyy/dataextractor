@@ -231,7 +231,7 @@ from io import BytesIO
 import re
 import pandas as pd
 
-def positions_view(data, prices_df=None):
+def positions_view(data, prices_df=None,groups_file=None):
     """
     Positions view grouped into separate sheets.
 
@@ -260,12 +260,7 @@ def positions_view(data, prices_df=None):
         st.info("No client data found. Please upload your main Excel file first.")
         return
 
-    # ---------- 0) Optional Groups mapping upload ----------
-    grp_file = st.file_uploader(
-        "Upload Groups mapping (columns: Sequence, Groups, Name) — optional",
-        type=["xlsx", "csv"],
-        key="groups_mapping_upload_positions"
-    )
+
 
     def _norm_name(x):
         return str(x).strip().title()
@@ -274,12 +269,12 @@ def positions_view(data, prices_df=None):
     clients_df = pd.DataFrame({"Name": sorted(data.keys())})
     grouped_meta = None
 
-    if grp_file is not None:
+    if groups_file is not None:
         try:
-            if grp_file.name.lower().endswith(".csv"):
-                gdf = pd.read_csv(grp_file)
+            if groups_file.name.lower().endswith(".csv"):
+                gdf = pd.read_csv(groups_file)
             else:
-                gdf = pd.read_excel(grp_file)
+                gdf = pd.read_excel(groups_file)
 
             # Robust column mapping
             colmap = {c.lower().strip(): c for c in gdf.columns}
@@ -609,25 +604,36 @@ def positions_view(data, prices_df=None):
 # -------------------------------------------------
 # Main
 # -------------------------------------------------
-uploaded = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"])
-if not uploaded:
-    st.info("Please upload an Excel file to begin.")
-else:
+# existing main file uploader
+uploaded = st.file_uploader("Upload main Excel (.xlsx)", type=["xlsx"])
+
+if uploaded:
     data, prices_df = extract_client_data(uploaded)
+
+    # 🔹 NEW: groups mapping uploader (top-level, not inside positions_view)
+    groups_file = st.file_uploader(
+        "Optional: Upload Groups mapping (Sequence, Groups, Name)",
+        type=["xlsx", "csv"],
+        key="groups_mapping_top"
+    )
+
     view = st.selectbox(
         "Select View",
-        ["Client View", "Total Portfolio View", "Total Portfolio View (Weights)", "Stock Prices View", "Positions View"]
+        ["Client View", "Total Portfolio View", "Stock Prices View", "Positions View"]
     )
+
     if view == "Client View":
         client_view(data)
     elif view == "Total Portfolio View":
         total_portfolio_view(data)
     elif view == "Stock Prices View":
         stock_prices_view(prices_df)
-    elif view == "Total Portfolio View (Weights)":
-        total_portfolio_view_weights(data)
-    else:
-        positions_view(data,prices_df)
+    elif view == "Positions View":
+        # 🔹 pass groups_file into positions_view
+        positions_view(data, prices_df, groups_file)
+else:
+    st.info("Please upload the main Excel file to begin.")
+
 
 
 
