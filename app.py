@@ -307,14 +307,18 @@ def positions_view(data, prices_df=None):
         except Exception as e:
             st.warning(f"Could not read groups file: {e}")
 
-    if grouped_meta is None:
+        if grouped_meta is None:
         grouped_meta = clients_df.copy()
         grouped_meta["Groups"] = "Ungrouped"
         grouped_meta["SeqSort"] = 0
 
+    if "Sequence" not in grouped_meta.columns:
+        grouped_meta["Sequence"] = None
+
     st.write("**Planned group order:**")
+    preview_cols = [c for c in ["Groups","Name","Sequence"] if c in grouped_meta.columns]
     st.dataframe(
-        grouped_meta[["Groups", "Name", "Sequence"]],
+        grouped_meta[preview_cols],
         hide_index=True,
         use_container_width=True,
     )
