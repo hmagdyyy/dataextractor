@@ -73,7 +73,7 @@ def extract_client_data(file):
                 start_row = r[0].row + 1
                 break
 
-        stock_rows = []
+                stock_rows = []
         stream_mv = 0.0
         momentum_mv = 0.0
         last_stock_row = None
@@ -88,11 +88,12 @@ def extract_client_data(file):
                     last_stock_row = r[0].row
                     break
 
-                name = r[1].value
-                qty = r[2].value
-                price = r[4].value   # Column E
-                mv = r[7].value if len(r) > 7 else 0
-                wt = r[8].value if len(r) > 8 else 0
+                name = r[1].value              # B = Name
+                qty = r[2].value               # C = Quantity
+                cost = r[3].value if len(r) > 3 else 0   # D = Cost  ✅ NEW
+                price = r[4].value if len(r) > 4 else 0  # E = Price
+                mv = r[7].value if len(r) > 7 else 0     # H = MV
+                wt = r[8].value if len(r) > 8 else 0     # I = Weight
                 if not name:
                     continue
 
@@ -108,10 +109,12 @@ def extract_client_data(file):
                     stock_rows.append({
                         "Company Name": normalize_stock(name_str),
                         "Quantity": float(qty or 0),
+                        "Cost": float(cost or 0),             # ✅ NEW
                         "Price": float(price or 0),
                         "Market Value": float(mv or 0),
                         "Weight": wt or 0,
                     })
+
 
             # Scan up to 10 rows after stocks for ICs
             if not last_stock_row:
@@ -139,7 +142,7 @@ def extract_client_data(file):
 
         df_stocks = pd.DataFrame(
             stock_rows,
-            columns=["Company Name", "Quantity", "Price", "Market Value", "Weight"]
+            columns=["Company Name", "Quantity","Cost", "Price", "Market Value", "Weight"]
         )
 
         out[client] = {
@@ -179,8 +182,11 @@ def client_view(data):
 
 def total_portfolio_view(data):
     st.subheader("Total Portfolio View")
+
+    # all unique stock tickers
     all_stocks = sorted({s for v in data.values() for s in v["data"]["Company Name"].unique()})
     rows = []
+
     for client, info in sorted(data.items()):
         row = {
             "Client": client,
@@ -191,35 +197,73 @@ def total_portfolio_view(data):
             "Total Cash": info["total_cash"],
             "NAV": info["aum"],
         }
+
+        # initialise Qty & Cost columns for all stocks
         for s in all_stocks:
-            row[s] = 0
+            row[f"{s} Qty"] = 0
+            row[f"{s} Cost"] = 0
+
+        # fill from this client's data
         for _, r in info["data"].iterrows():
-            row[r["Company Name"]] = r["Quantity"]
+            sym = r["Company Name"]
+            q = float(r.get("Quantity", 0) or 0)
+            c = float(r.get("Cost", 0) or 0)
+            row[f"{sym} Qty"] = q
+            row[f"{sym} Cost"] = c
+
         rows.append(row)
-    cols = ["Client", "Cash", "Dividends", "Stream", "Momentum", "Total Cash"] + all_stocks + ["NAV"]
+
+    # build column order
+    fixed = ["Client", "Cash", "Dividends", "Stream", "Momentum", "Total Cash"]
+    stock_cols = []
+    for s in all_stocks:
+        stock_cols.append(f"{s} Qty")
+        stock_cols.append(f"{s} Cost")
+    cols = fixed + stock_cols + ["NAV"]
+
     mat = pd.DataFrame(rows, columns=cols)
     st.dataframe(mat, use_container_width=True)
     export_xlsx(mat, filename="total_portfolio.xlsx", sheet_name="Portfolio")
 
+
 def total_portfolio_view_weights(data):
     st.subheader("Total Portfolio View (Weights)")
+
     all_stocks = sorted({s for v in data.values() for s in v["data"]["Company Name"].unique()})
     rows = []
+
     for client, info in sorted(data.items()):
         row = {
             "Client": client,
             "Cash": info["cash"],
             "NAV": info["aum"],
         }
+
+        # initialise Weight & Cost for all stocks
         for s in all_stocks:
-            row[s] = 0
+            row[f"{s} Wt"] = 0
+            row[f"{s} Cost"] = 0
+
         for _, r in info["data"].iterrows():
-            row[r["Company Name"]] = r["Weight"]
+            sym = r["Company Name"]
+            w = float(r.get("Weight", 0) or 0)
+            c = float(r.get("Cost", 0) or 0)
+            row[f"{sym} Wt"] = w
+            row[f"{sym} Cost"] = c
+
         rows.append(row)
-    cols = ["Client", "Cash"] + all_stocks + ["NAV"]
+
+    fixed = ["Client", "Cash"]
+    stock_cols = []
+    for s in all_stocks:
+        stock_cols.append(f"{s} Wt")
+        stock_cols.append(f"{s} Cost")
+    cols = fixed + stock_cols + ["NAV"]
+
     mat = pd.DataFrame(rows, columns=cols)
     st.dataframe(mat, use_container_width=True)
     export_xlsx(mat, filename="total_portfolio_weights.xlsx", sheet_name="Portfolio")
+
 
 def stock_prices_view(prices_df: pd.DataFrame):
     st.subheader("Stock Prices (from Column E)")
