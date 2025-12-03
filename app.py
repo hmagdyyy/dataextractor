@@ -73,7 +73,7 @@ def extract_client_data(file):
                 start_row = r[0].row + 1
                 break
 
-                stock_rows = []
+        stock_rows = []
         stream_mv = 0.0
         momentum_mv = 0.0
         last_stock_row = None
