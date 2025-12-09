@@ -4,6 +4,7 @@ import openpyxl
 from openpyxl.styles import PatternFill as XLFill
 from openpyxl.utils import get_column_letter
 from io import BytesIO
+import re
 
 st.set_page_config(page_title="Mini Client Dashboard", layout="wide")
 st.title("Mini Client Dashboard")
@@ -16,6 +17,7 @@ def normalize_stock(s: str) -> str:
         return ""
     s = str(s).strip().upper()
     return s if s.endswith(".CA") else f"{s}.CA"
+
 
 def export_xlsx(df: pd.DataFrame, filename="export.xlsx", sheet_name="Sheet1"):
     """Export a DataFrame as a single-sheet XLSX with simple numeric formatting."""
@@ -49,7 +51,9 @@ def extract_client_data(file):
       - Client: B4 (fallback sheet name)
       - Cash: C27
       - Dividends: C32
-      - Stocks: from 'Stocks' block (B=Name, C=Qty, E=Price, H=MV, I=Weight)
+      - Fees Under Payment: Cxx where Bxx = 'Fees Under Payment' (scan rows ~35–70)
+      - Stocks: from 'Stocks' block:
+            B = Name, C = Qty, D = Cost, E = Price, H = MV, I = Weight
       - ICs: scan next <=10 rows after stocks end for Stk-300 (Stream MV) & Stk-302 (Momentum MV)
       - AUM: 'Total Assets' row (col C)
       - Total Cash = Cash + Dividends + Stream(MV)
@@ -65,6 +69,14 @@ def extract_client_data(file):
 
         cash = float(ws["C27"].value or 0)
         dividends = float(ws["C32"].value or 0)
+
+        # Fees Under Payment (usually C41/C42, next to label in column B)
+        fees_under_payment = 0.0
+        for r in ws.iter_rows(min_row=35, max_row=70):
+            label = r[1].value  # column B
+            if isinstance(label, str) and label.strip().lower() == "fees under payment":
+                fees_under_payment = float(r[2].value or 0.0)  # column C
+                break
 
         # Locate 'Stocks' start
         start_row = None
@@ -90,7 +102,7 @@ def extract_client_data(file):
 
                 name = r[1].value              # B = Name
                 qty = r[2].value               # C = Quantity
-                cost = r[3].value if len(r) > 3 else 0   # D = Cost  ✅ NEW
+                cost = r[3].value if len(r) > 3 else 0   # D = Cost
                 price = r[4].value if len(r) > 4 else 0  # E = Price
                 mv = r[7].value if len(r) > 7 else 0     # H = MV
                 wt = r[8].value if len(r) > 8 else 0     # I = Weight
@@ -109,12 +121,11 @@ def extract_client_data(file):
                     stock_rows.append({
                         "Company Name": normalize_stock(name_str),
                         "Quantity": float(qty or 0),
-                        "Cost": float(cost or 0),             # ✅ NEW
+                        "Cost": float(cost or 0),
                         "Price": float(price or 0),
                         "Market Value": float(mv or 0),
                         "Weight": wt or 0,
                     })
-
 
             # Scan up to 10 rows after stocks for ICs
             if not last_stock_row:
@@ -142,7 +153,7 @@ def extract_client_data(file):
 
         df_stocks = pd.DataFrame(
             stock_rows,
-            columns=["Company Name", "Quantity","Cost", "Price", "Market Value", "Weight"]
+            columns=["Company Name", "Quantity", "Cost", "Price", "Market Value", "Weight"]
         )
 
         out[client] = {
@@ -153,6 +164,7 @@ def extract_client_data(file):
             "momentum_mv": momentum_mv,
             "total_cash": total_cash,
             "aum": aum,
+            "fees_under_payment": fees_under_payment,
         }
 
     # Prices table
@@ -180,47 +192,44 @@ def client_view(data):
     st.dataframe(info["data"], use_container_width=True, hide_index=True)
     export_xlsx(info["data"], filename=f"{client}_holdings.xlsx", sheet_name="Holdings")
 
+
 def total_portfolio_view(data):
     st.subheader("Total Portfolio View")
 
-    # all unique stock tickers
     all_stocks = sorted({s for v in data.values() for s in v["data"]["Company Name"].unique()})
     rows = []
 
     for client, info in sorted(data.items()):
+        raw_cash = float(info["cash"])
+        fees = float(info.get("fees_under_payment", 0.0) or 0.0)
+        net_cash = raw_cash - fees
+
+        # Total Cash for this view uses net cash
+        total_cash_view = net_cash + float(info["dividends"]) + float(info["stream_mv"])
+
         row = {
             "Client": client,
-            "Cash": info["cash"],
+            "Cash": net_cash,
+            "Fees Under Payment": fees,
             "Dividends": info["dividends"],
             "Stream": info["stream_mv"],
             "Momentum": info["momentum_mv"],
-            "Total Cash": info["total_cash"],
+            "Total Cash": total_cash_view,
             "NAV": info["aum"],
         }
 
-        # initialise Qty & Cost columns for all stocks
+        # initialise stock Qty columns
         for s in all_stocks:
-            row[f"{s} Qty"] = 0
-            row[f"{s} Cost"] = 0
+            row[s] = 0
 
-        # fill from this client's data
+        # fill quantities
         for _, r in info["data"].iterrows():
-            sym = r["Company Name"]
-            q = float(r.get("Quantity", 0) or 0)
-            c = float(r.get("Cost", 0) or 0)
-            row[f"{sym} Qty"] = q
-            row[f"{sym} Cost"] = c
+            row[r["Company Name"]] = r["Quantity"]
 
         rows.append(row)
 
-    # build column order
-    fixed = ["Client", "Cash", "Dividends", "Stream", "Momentum", "Total Cash"]
-    stock_cols = []
-    for s in all_stocks:
-        stock_cols.append(f"{s} Qty")
-        stock_cols.append(f"{s} Cost")
-    cols = fixed + stock_cols + ["NAV"]
-
+    cols = ["Client", "Cash", "Fees Under Payment", "Dividends", "Stream",
+            "Momentum", "Total Cash"] + all_stocks + ["NAV"]
     mat = pd.DataFrame(rows, columns=cols)
     st.dataframe(mat, use_container_width=True)
     export_xlsx(mat, filename="total_portfolio.xlsx", sheet_name="Portfolio")
@@ -233,33 +242,26 @@ def total_portfolio_view_weights(data):
     rows = []
 
     for client, info in sorted(data.items()):
+        raw_cash = float(info["cash"])
+        fees = float(info.get("fees_under_payment", 0.0) or 0.0)
+        net_cash = raw_cash - fees
+
         row = {
             "Client": client,
-            "Cash": info["cash"],
+            "Cash": net_cash,
+            "Fees Under Payment": fees,
             "NAV": info["aum"],
         }
 
-        # initialise Weight & Cost for all stocks
         for s in all_stocks:
-            row[f"{s} Wt"] = 0
-            row[f"{s} Cost"] = 0
+            row[s] = 0
 
         for _, r in info["data"].iterrows():
-            sym = r["Company Name"]
-            w = float(r.get("Weight", 0) or 0)
-            c = float(r.get("Cost", 0) or 0)
-            row[f"{sym} Wt"] = w
-            row[f"{sym} Cost"] = c
+            row[r["Company Name"]] = r["Weight"]
 
         rows.append(row)
 
-    fixed = ["Client", "Cash"]
-    stock_cols = []
-    for s in all_stocks:
-        stock_cols.append(f"{s} Wt")
-        stock_cols.append(f"{s} Cost")
-    cols = fixed + stock_cols + ["NAV"]
-
+    cols = ["Client", "Cash", "Fees Under Payment"] + all_stocks + ["NAV"]
     mat = pd.DataFrame(rows, columns=cols)
     st.dataframe(mat, use_container_width=True)
     export_xlsx(mat, filename="total_portfolio_weights.xlsx", sheet_name="Portfolio")
@@ -271,10 +273,9 @@ def stock_prices_view(prices_df: pd.DataFrame):
     export_xlsx(prices_df, filename="stock_prices.xlsx", sheet_name="Prices")
 
 
-from io import BytesIO
-import re
-import pandas as pd
-
+# -------------------------------------------------
+# Positions View (unchanged logic, with colors & summary styling)
+# -------------------------------------------------
 def positions_view(data, prices_df=None, groups_file=None):
     """
     Positions view grouped into separate sheets.
@@ -301,13 +302,7 @@ def positions_view(data, prices_df=None, groups_file=None):
     - MV and Weight for stock rows are Excel formulas (editable).
     - NAV row is an Excel formula (editable).
     - Streamlit preview shows the same row structure (all groups stacked).
-    - Colors/formatting match Example.xlsx:
-        Name row  -> blue  (#95A8C3)
-        NAV       -> light grey (#F4F4F4)
-        Total Cash-> white
-        Stocks hdr-> light blue (#CCE2F1)
-        Stocks    -> alternating white / light grey (#F4F4F4), starting white
-        Momentum  -> light grey
+    - Colors/formatting match Example.xlsx.
     """
 
     st.subheader("Positions View (Per-Group Sheets + Summary + Formulas)")
@@ -410,8 +405,8 @@ def positions_view(data, prices_df=None, groups_file=None):
                 while sheet_name in writer.book.sheetnames:
                     sheet_name = sanitize_sheet_name(f"{base}-{idx}")
                     idx += 1
-                pd.DataFrame([["Group", grp_name, None, None]], columns=header)\
-                  .to_excel(writer, index=False, sheet_name=sheet_name)
+                pd.DataFrame([["Group", grp_name, None, None]], columns=header) \
+                    .to_excel(writer, index=False, sheet_name=sheet_name)
                 created_any_sheet = True
                 continue
 
@@ -616,8 +611,7 @@ def positions_view(data, prices_df=None, groups_file=None):
                 ws.cell(row=rr, column=11, value=row_sum["Weight"]).number_format = "0.00%"
                 ws.cell(row=rr, column=12, value=row_sum["Price"]).number_format = "#,##0.00"
 
-                            # --- Style summary block (columns H:L) ---
-
+            # --- Style summary block (columns H:L) ---
             # 1) "Group Summary" title row
             for c in range(8, 13):  # H..L
                 ws.cell(row=summary_start, column=c).fill = STOCKS_HEADER_FILL
@@ -635,14 +629,13 @@ def positions_view(data, prices_df=None, groups_file=None):
 
             # 4) Per-stock summary rows (alternate white / light grey)
             if not gsum.empty:
-                alt = True
+                alt_fill = True
                 for i in range(len(gsum)):
                     rr = sum_header_row + 1 + i
-                    fill = STOCK_WHITE_FILL if alt else STOCK_ALT_FILL
+                    fill = STOCK_WHITE_FILL if alt_fill else STOCK_ALT_FILL
                     for c in range(8, 13):  # H..L
                         ws.cell(row=rr, column=c).fill = fill
-                    alt = not alt
-
+                    alt_fill = not alt_fill
 
             if not gsum.empty:
                 price_start = sum_header_row + 1
@@ -726,7 +719,6 @@ def positions_view(data, prices_df=None, groups_file=None):
                 label = (ws.cell(row=r, column=1).value or "").strip().lower()
 
                 if label == "group":
-                    # use same blue bar style as Name
                     for c in range(1, 5):
                         ws.cell(row=r, column=c).fill = NAME_BAR_FILL
                     in_stock_block = False
@@ -758,12 +750,10 @@ def positions_view(data, prices_df=None, groups_file=None):
                     in_stock_block = False
 
                 elif label == "" or label is None:
-                    # blank spacer rows: no fill change
                     in_stock_block = False
                     continue
 
                 else:
-                    # stock rows (or any extra label inside the block)
                     if in_stock_block:
                         fill = STOCK_WHITE_FILL if alt_white else STOCK_ALT_FILL
                         for c in range(1, 5):
@@ -786,15 +776,6 @@ def positions_view(data, prices_df=None, groups_file=None):
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-    # ---------- 6) Streamlit preview ----------
-    if all_preview_rows:
-        preview_df = pd.DataFrame(all_preview_rows, columns=header)
-        st.caption("Preview (structure matches Excel sheets):")
-        st.dataframe(preview_df, hide_index=True, use_container_width=True)
-    else:
-        st.info("No rows to preview.")
-
-
     # ---------- Streamlit preview (mimics Excel rows) ----------
     if all_preview_rows:
         preview_df = pd.DataFrame(all_preview_rows, columns=header)
@@ -803,19 +784,15 @@ def positions_view(data, prices_df=None, groups_file=None):
     else:
         st.info("No rows to preview.")
 
-
-
-
 # -------------------------------------------------
 # Main
 # -------------------------------------------------
-# existing main file uploader
 uploaded = st.file_uploader("Upload main Excel (.xlsx)", type=["xlsx"])
 
 if uploaded:
     data, prices_df = extract_client_data(uploaded)
 
-    # 🔹 NEW: groups mapping uploader (top-level, not inside positions_view)
+    # Groups mapping uploader (top-level, not inside positions_view)
     groups_file = st.file_uploader(
         "Optional: Upload Groups mapping (Sequence, Groups, Name)",
         type=["xlsx", "csv"],
@@ -824,7 +801,13 @@ if uploaded:
 
     view = st.selectbox(
         "Select View",
-        ["Client View", "Total Portfolio View", "Total Portfolio View (Weights)", "Stock Prices View", "Positions View"]
+        [
+            "Client View",
+            "Total Portfolio View",
+            "Total Portfolio View (Weights)",
+            "Stock Prices View",
+            "Positions View",
+        ]
     )
 
     if view == "Client View":
@@ -836,10 +819,10 @@ if uploaded:
     elif view == "Stock Prices View":
         stock_prices_view(prices_df)
     elif view == "Positions View":
-        # 🔹 pass groups_file into positions_view
         positions_view(data, prices_df, groups_file)
 else:
     st.info("Please upload the main Excel file to begin.")
+
 
 
 
