@@ -196,6 +196,7 @@ def client_view(data):
 def total_portfolio_view(data):
     st.subheader("Total Portfolio View")
 
+    # all unique stocks
     all_stocks = sorted({s for v in data.values() for s in v["data"]["Company Name"].unique()})
     rows = []
 
@@ -204,12 +205,12 @@ def total_portfolio_view(data):
         fees = float(info.get("fees_under_payment", 0.0) or 0.0)
         net_cash = raw_cash - fees
 
-        # Total Cash for this view uses net cash
+        # Total Cash for this view uses net cash (not the original total_cash)
         total_cash_view = net_cash + float(info["dividends"]) + float(info["stream_mv"])
 
         row = {
             "Client": client,
-            "Cash": net_cash,
+            "Cash": net_cash,                   # net of fees
             "Fees Under Payment": fees,
             "Dividends": info["dividends"],
             "Stream": info["stream_mv"],
@@ -218,18 +219,29 @@ def total_portfolio_view(data):
             "NAV": info["aum"],
         }
 
-        # initialise stock Qty columns
+        # initialise Qty & Cost columns for all stocks
         for s in all_stocks:
-            row[s] = 0
+            row[f"{s} Qty"] = 0
+            row[f"{s} Cost"] = 0
 
-        # fill quantities
+        # fill per stock from client's data
         for _, r in info["data"].iterrows():
-            row[r["Company Name"]] = r["Quantity"]
+            sym = r["Company Name"]
+            q = float(r.get("Quantity", 0) or 0)
+            c = float(r.get("Cost", 0) or 0)
+            row[f"{sym} Qty"] = q
+            row[f"{sym} Cost"] = c
 
         rows.append(row)
 
-    cols = ["Client", "Cash", "Fees Under Payment", "Dividends", "Stream",
-            "Momentum", "Total Cash"] + all_stocks + ["NAV"]
+    # column order: fixed, then for each stock -> Qty, Cost, then NAV
+    fixed = ["Client", "Cash", "Fees Under Payment", "Dividends", "Stream", "Momentum", "Total Cash"]
+    stock_cols = []
+    for s in all_stocks:
+        stock_cols.append(f"{s} Qty")
+        stock_cols.append(f"{s} Cost")
+    cols = fixed + stock_cols + ["NAV"]
+
     mat = pd.DataFrame(rows, columns=cols)
     st.dataframe(mat, use_container_width=True)
     export_xlsx(mat, filename="total_portfolio.xlsx", sheet_name="Portfolio")
@@ -248,20 +260,32 @@ def total_portfolio_view_weights(data):
 
         row = {
             "Client": client,
-            "Cash": net_cash,
+            "Cash": net_cash,                   # net of fees
             "Fees Under Payment": fees,
             "NAV": info["aum"],
         }
 
+        # initialise Weight & Cost for all stocks
         for s in all_stocks:
-            row[s] = 0
+            row[f"{s} Wt"] = 0
+            row[f"{s} Cost"] = 0
 
         for _, r in info["data"].iterrows():
-            row[r["Company Name"]] = r["Weight"]
+            sym = r["Company Name"]
+            w = float(r.get("Weight", 0) or 0)
+            c = float(r.get("Cost", 0) or 0)
+            row[f"{sym} Wt"] = w
+            row[f"{sym} Cost"] = c
 
         rows.append(row)
 
-    cols = ["Client", "Cash", "Fees Under Payment"] + all_stocks + ["NAV"]
+    fixed = ["Client", "Cash", "Fees Under Payment"]
+    stock_cols = []
+    for s in all_stocks:
+        stock_cols.append(f"{s} Wt")
+        stock_cols.append(f"{s} Cost")
+    cols = fixed + stock_cols + ["NAV"]
+
     mat = pd.DataFrame(rows, columns=cols)
     st.dataframe(mat, use_container_width=True)
     export_xlsx(mat, filename="total_portfolio_weights.xlsx", sheet_name="Portfolio")
@@ -274,7 +298,7 @@ def stock_prices_view(prices_df: pd.DataFrame):
 
 
 # -------------------------------------------------
-# Positions View (unchanged logic, with colors & summary styling)
+# Positions View (as before, with summary styling)
 # -------------------------------------------------
 def positions_view(data, prices_df=None, groups_file=None):
     """
@@ -822,7 +846,6 @@ if uploaded:
         positions_view(data, prices_df, groups_file)
 else:
     st.info("Please upload the main Excel file to begin.")
-
 
 
 
