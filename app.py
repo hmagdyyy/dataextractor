@@ -2,9 +2,9 @@ import streamlit as st
 import pandas as pd
 import openpyxl
 from openpyxl.styles import PatternFill as XLFill
-from openpyxl.utils import get_column_letter
 from io import BytesIO
 import re
+from datetime import datetime
 
 st.set_page_config(page_title="Mini Client Dashboard", layout="wide")
 st.title("Mini Client Dashboard")
@@ -18,6 +18,8 @@ def normalize_stock(s: str) -> str:
     s = str(s).strip().upper()
     return s if s.endswith(".CA") else f"{s}.CA"
 
+def norm_client_name(s: str) -> str:
+    return str(s).strip().title() if s is not None else ""
 
 def export_xlsx(df: pd.DataFrame, filename="export.xlsx", sheet_name="Sheet1"):
     """Export a DataFrame as a single-sheet XLSX with simple numeric formatting."""
@@ -25,11 +27,9 @@ def export_xlsx(df: pd.DataFrame, filename="export.xlsx", sheet_name="Sheet1"):
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name=sheet_name)
         ws = writer.sheets[sheet_name]
-        # Basic number format (commas). We don't force percent to avoid scaling surprises.
         for col in ws.columns:
             for cell in col[1:]:
                 if isinstance(cell.value, (int, float)):
-                    # Quantity columns look nicer as integers when exact
                     if float(cell.value).is_integer():
                         cell.number_format = "#,##0"
                     else:
@@ -42,22 +42,137 @@ def export_xlsx(df: pd.DataFrame, filename="export.xlsx", sheet_name="Sheet1"):
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
+def parse_mixed_date(x):
+    """
+    If contains '-' => dd-mm-yyyy
+    If contains '/' => mm/dd/yyyy
+    Otherwise let pandas try.
+    """
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return pd.NaT
+    if isinstance(x, (datetime, pd.Timestamp)):
+        return pd.to_datetime(x, errors="coerce")
+
+    s = str(x).strip()
+    if not s:
+        return pd.NaT
+
+    try:
+        if "-" in s:
+            return pd.to_datetime(s, errors="coerce", dayfirst=True)
+        if "/" in s:
+            return pd.to_datetime(s, errors="coerce", dayfirst=False)
+        return pd.to_datetime(s, errors="coerce")
+    except Exception:
+        return pd.NaT
+
 # -------------------------------------------------
-# Extraction
+# Cashflow (.xls) parser
+# -------------------------------------------------
+def load_cashflows_xls(xls_file):
+    """
+    Matches:
+      - Entry Date: column A
+      - Client: column D (title 'Client')
+      - Type: column G (under Trans.Date)  In=deposit, Out=withdrawal
+      - Amount: column I (under Status)
+    Returns: dict client -> DataFrame[Entry Date, Type, Amount] sorted desc
+    """
+    if xls_file is None:
+        return {}
+
+    # read .xls robustly (requires xlrd)
+    try:
+        df = pd.read_excel(xls_file, sheet_name=0, engine="xlrd")
+    except Exception:
+        df = pd.read_excel(xls_file, sheet_name=0)
+
+    if df is None or df.empty:
+        return {}
+
+    # if columns are too few, try header=None
+    try:
+        if df.shape[1] < 9:
+            df = pd.read_excel(xls_file, sheet_name=0, header=None, engine="xlrd")
+    except Exception:
+        pass
+
+    if df.shape[1] < 9:
+        return {}
+
+    entry_col = 0   # A
+    client_col = 3  # D
+    type_col = 6    # G
+    amt_col = 8     # I
+
+    out = {}
+    for _, r in df.iterrows():
+        client = r.iloc[client_col] if client_col < len(r) else None
+        if client is None or str(client).strip() == "" or str(client).strip().lower() == "client":
+            continue
+
+        entry = r.iloc[entry_col] if entry_col < len(r) else None
+        tx_type = r.iloc[type_col] if type_col < len(r) else None
+        amt = r.iloc[amt_col] if amt_col < len(r) else None
+
+        client_n = norm_client_name(client)
+        dt = parse_mixed_date(entry)
+
+        t_raw = str(tx_type).strip().lower() if tx_type is not None else ""
+        if t_raw == "in":
+            t = "In"
+        elif t_raw == "out":
+            t = "Out"
+        else:
+            t = str(tx_type).strip().title() if tx_type is not None else ""
+
+        try:
+            amt_f = float(amt)
+        except Exception:
+            amt_f = 0.0
+
+        out.setdefault(client_n, []).append({"Entry Date": dt, "Type": t, "Amount": amt_f})
+
+    dfs = {}
+    for c, rows in out.items():
+        cdf = pd.DataFrame(rows)
+        if not cdf.empty:
+            cdf["Entry Date"] = pd.to_datetime(cdf["Entry Date"], errors="coerce")
+            cdf = cdf.sort_values("Entry Date", ascending=False).reset_index(drop=True)
+        dfs[c] = cdf
+    return dfs
+
+def style_cashflows(df: pd.DataFrame):
+    if df is None or df.empty:
+        return df
+
+    def row_style(row):
+        t = str(row.get("Type", "")).strip().lower()
+        if t == "in":
+            return ["background-color: #d9f2d9"] * len(row)  # light green
+        if t == "out":
+            return ["background-color: #f7d6d6"] * len(row)  # light red
+        return [""] * len(row)
+
+    sdf = df.copy()
+    return sdf.style.apply(row_style, axis=1).format({"Amount": "{:,.2f}"})
+
+
+# -------------------------------------------------
+# Extraction (main workbook)
 # -------------------------------------------------
 def extract_client_data(file):
     """
     Extracts:
-      - Client: B4 (fallback sheet name)
+      - Client: B4
       - Cash: C27
       - Dividends: C32
-      - Fees Under Payment: Cxx where Bxx = 'Fees Under Payment' (scan rows ~35–70)
-      - Stocks: from 'Stocks' block:
-            B = Name, C = Qty, D = Cost, E = Price, H = MV, I = Weight
+      - Fees Under Payment: Cxx where Bxx = 'Fees Under Payment'
+      - Stocks: B=Name, C=Qty, D=Cost, E=Price, H=MV, I=Weight
       - ICs: scan next <=10 rows after stocks end for Stk-300 (Stream MV) & Stk-302 (Momentum MV)
       - AUM: 'Total Assets' row (col C)
-      - Total Cash = Cash + Dividends + Stream(MV)
-      - Prices table (unique stock -> latest seen price)
+      - Total Cash (legacy): Cash + Dividends + Stream(MV)
+      - Prices table
     """
     wb = openpyxl.load_workbook(file, data_only=True)
     out = {}
@@ -70,15 +185,15 @@ def extract_client_data(file):
         cash = float(ws["C27"].value or 0)
         dividends = float(ws["C32"].value or 0)
 
-        # Fees Under Payment (usually C41/C42, next to label in column B)
+        # Fees Under Payment (scan rows 35..70, label in B, value in C)
         fees_under_payment = 0.0
         for r in ws.iter_rows(min_row=35, max_row=70):
-            label = r[1].value  # column B
+            label = r[1].value
             if isinstance(label, str) and label.strip().lower() == "fees under payment":
-                fees_under_payment = float(r[2].value or 0.0)  # column C
+                fees_under_payment = float(r[2].value or 0.0)
                 break
 
-        # Locate 'Stocks' start
+        # Locate stocks
         start_row = None
         for r in ws.iter_rows(min_row=1, max_row=100):
             if str(r[0].value).strip().lower() == "stocks":
@@ -91,7 +206,6 @@ def extract_client_data(file):
         last_stock_row = None
 
         if start_row:
-            # Read stocks until grey+empty row
             for r in ws.iter_rows(min_row=start_row):
                 cell_b = r[1]
                 rgb = getattr(getattr(cell_b.fill, "start_color", None), "rgb", None)
@@ -100,23 +214,23 @@ def extract_client_data(file):
                     last_stock_row = r[0].row
                     break
 
-                name = r[1].value              # B = Name
-                qty = r[2].value               # C = Quantity
-                cost = r[3].value if len(r) > 3 else 0   # D = Cost
-                price = r[4].value if len(r) > 4 else 0  # E = Price
-                mv = r[7].value if len(r) > 7 else 0     # H = MV
-                wt = r[8].value if len(r) > 8 else 0     # I = Weight
+                name = r[1].value
+                qty = r[2].value
+                cost = r[3].value if len(r) > 3 else 0
+                price = r[4].value if len(r) > 4 else 0
+                mv = r[7].value if len(r) > 7 else 0
+                wt = r[8].value if len(r) > 8 else 0
+
                 if not name:
                     continue
 
                 name_str = str(name).strip()
                 name_up = name_str.upper()
 
-                # Collect prices
                 if isinstance(price, (int, float)):
                     all_prices[normalize_stock(name_str)] = float(price)
 
-                # Ignore ICs here (we'll pick them from the post-stocks scan), take only real stocks
+                # ignore IC tickers here
                 if name_up not in ("STK-300", "STK-302") and isinstance(qty, (int, float)):
                     stock_rows.append({
                         "Company Name": normalize_stock(name_str),
@@ -127,7 +241,7 @@ def extract_client_data(file):
                         "Weight": wt or 0,
                     })
 
-            # Scan up to 10 rows after stocks for ICs
+            # Scan <=10 rows after stocks for ICs
             if not last_stock_row:
                 last_stock_row = start_row
             ic_start, ic_end = last_stock_row + 1, last_stock_row + 11
@@ -167,36 +281,54 @@ def extract_client_data(file):
             "fees_under_payment": fees_under_payment,
         }
 
-    # Prices table
-    prices_df = pd.DataFrame(sorted(all_prices.items()), columns=["Stock", "Price"]) \
-                if all_prices else pd.DataFrame(columns=["Stock", "Price"])
+    prices_df = (
+        pd.DataFrame(sorted(all_prices.items()), columns=["Stock", "Price"])
+        if all_prices else pd.DataFrame(columns=["Stock", "Price"])
+    )
     return out, prices_df
+
 
 # -------------------------------------------------
 # Views
 # -------------------------------------------------
-def client_view(data):
+def client_view(data, cashflows_by_client=None):
     client = st.selectbox("Select Client", sorted(data.keys()))
     info = data[client]
 
     st.subheader(client)
+
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Cash (C27)", f"{info['cash']:,.2f}")
     c2.metric("Dividends (C32)", f"{info['dividends']:,.2f}")
     c3.metric("Stream (Stk-300)", f"{info['stream_mv']:,.2f}")
     c4.metric("Momentum (Stk-302)", f"{info['momentum_mv']:,.2f}")
     c5.metric("Total Cash", f"{info['total_cash']:,.2f}")
+
     st.metric("AUM", f"{info['aum']:,.2f}")
 
     st.markdown("**Stock Holdings**")
     st.dataframe(info["data"], use_container_width=True, hide_index=True)
     export_xlsx(info["data"], filename=f"{client}_holdings.xlsx", sheet_name="Holdings")
 
+    st.markdown("---")
+    st.subheader("Cashflows (optional)")
+
+    if cashflows_by_client and client in cashflows_by_client:
+        tx = cashflows_by_client[client].copy()
+        if tx is None or tx.empty:
+            st.info("No cashflow transactions found for this client.")
+        else:
+            tx["Entry Date"] = pd.to_datetime(tx["Entry Date"], errors="coerce")
+            tx = tx.sort_values("Entry Date", ascending=False).reset_index(drop=True)
+            st.dataframe(style_cashflows(tx), use_container_width=True, hide_index=True)
+            export_xlsx(tx, filename=f"{client}_cashflows.xlsx", sheet_name="Cashflows")
+    else:
+        st.info("Upload the Cashflow .xls file above to see transactions here (if available).")
+
 
 def total_portfolio_view(data):
     st.subheader("Total Portfolio View")
 
-    # all unique stocks
     all_stocks = sorted({s for v in data.values() for s in v["data"]["Company Name"].unique()})
     rows = []
 
@@ -205,12 +337,11 @@ def total_portfolio_view(data):
         fees = float(info.get("fees_under_payment", 0.0) or 0.0)
         net_cash = raw_cash - fees
 
-        # Total Cash for this view uses net cash (not the original total_cash)
         total_cash_view = net_cash + float(info["dividends"]) + float(info["stream_mv"])
 
         row = {
             "Client": client,
-            "Cash": net_cash,                   # net of fees
+            "Cash": net_cash,
             "Fees Under Payment": fees,
             "Dividends": info["dividends"],
             "Stream": info["stream_mv"],
@@ -219,27 +350,21 @@ def total_portfolio_view(data):
             "NAV": info["aum"],
         }
 
-        # initialise Qty & Cost columns for all stocks
         for s in all_stocks:
             row[f"{s} Qty"] = 0
             row[f"{s} Cost"] = 0
 
-        # fill per stock from client's data
         for _, r in info["data"].iterrows():
             sym = r["Company Name"]
-            q = float(r.get("Quantity", 0) or 0)
-            c = float(r.get("Cost", 0) or 0)
-            row[f"{sym} Qty"] = q
-            row[f"{sym} Cost"] = c
+            row[f"{sym} Qty"] = float(r.get("Quantity", 0) or 0)
+            row[f"{sym} Cost"] = float(r.get("Cost", 0) or 0)
 
         rows.append(row)
 
-    # column order: fixed, then for each stock -> Qty, Cost, then NAV
     fixed = ["Client", "Cash", "Fees Under Payment", "Dividends", "Stream", "Momentum", "Total Cash"]
     stock_cols = []
     for s in all_stocks:
-        stock_cols.append(f"{s} Qty")
-        stock_cols.append(f"{s} Cost")
+        stock_cols += [f"{s} Qty", f"{s} Cost"]
     cols = fixed + stock_cols + ["NAV"]
 
     mat = pd.DataFrame(rows, columns=cols)
@@ -260,30 +385,26 @@ def total_portfolio_view_weights(data):
 
         row = {
             "Client": client,
-            "Cash": net_cash,                   # net of fees
+            "Cash": net_cash,
             "Fees Under Payment": fees,
             "NAV": info["aum"],
         }
 
-        # initialise Weight & Cost for all stocks
         for s in all_stocks:
             row[f"{s} Wt"] = 0
             row[f"{s} Cost"] = 0
 
         for _, r in info["data"].iterrows():
             sym = r["Company Name"]
-            w = float(r.get("Weight", 0) or 0)
-            c = float(r.get("Cost", 0) or 0)
-            row[f"{sym} Wt"] = w
-            row[f"{sym} Cost"] = c
+            row[f"{sym} Wt"] = float(r.get("Weight", 0) or 0)
+            row[f"{sym} Cost"] = float(r.get("Cost", 0) or 0)
 
         rows.append(row)
 
     fixed = ["Client", "Cash", "Fees Under Payment"]
     stock_cols = []
     for s in all_stocks:
-        stock_cols.append(f"{s} Wt")
-        stock_cols.append(f"{s} Cost")
+        stock_cols += [f"{s} Wt", f"{s} Cost"]
     cols = fixed + stock_cols + ["NAV"]
 
     mat = pd.DataFrame(rows, columns=cols)
@@ -298,37 +419,9 @@ def stock_prices_view(prices_df: pd.DataFrame):
 
 
 # -------------------------------------------------
-# Positions View (as before, with summary styling)
+# Positions View (full version from your code)
 # -------------------------------------------------
 def positions_view(data, prices_df=None, groups_file=None):
-    """
-    Positions view grouped into separate sheets.
-
-    - Optional groups_file (Sequence, Groups, Name) to cluster and order clients.
-    - Each group -> its own sheet.
-    - Sheet layout (A:D):
-        Item | Value/Qty | Weight | MV
-        Group
-        Name
-        NAV (Excel formula) = Total Cash + SUM(stock MV) + Momentum
-        Total Cash
-        Stocks header
-        Stock rows (Weight & MV are Excel formulas)
-        Momentum
-        blank line
-    - Group summary in H:… at the BOTTOM of the sheet:
-        "Group Summary"
-        Total Cash   + Cash / NAV %
-        Total NAV
-        Total MV     + MV / NAV %
-        Cash / MV %
-        Then a per-stock table: Stock, Sum Qty, Sum MV, Weight, Price
-    - MV and Weight for stock rows are Excel formulas (editable).
-    - NAV row is an Excel formula (editable).
-    - Streamlit preview shows the same row structure (all groups stacked).
-    - Colors/formatting match Example.xlsx.
-    """
-
     st.subheader("Positions View (Per-Group Sheets + Summary + Formulas)")
 
     if not data:
@@ -391,15 +484,12 @@ def positions_view(data, prices_df=None, groups_file=None):
         grouped_meta["SeqSort"] = 0
         grouped_meta["Sequence"] = None
 
-    st.write("Groups detected (if no mapping uploaded, everyone is in 'Ungrouped').")
-
     # ---------- 1) Price map from prices_df (optional) ----------
     price_map = {}
     if isinstance(prices_df, pd.DataFrame) and not prices_df.empty:
         if "Stock" in prices_df.columns and "Price" in prices_df.columns:
             price_map = dict(zip(prices_df["Stock"], prices_df["Price"]))
 
-    # ---------- Utilities ----------
     def sanitize_sheet_name(s: str) -> str:
         s = re.sub(r'[:\\/?*\[\]]', "-", str(s)).strip()
         return (s or "Group")[:31]
@@ -416,7 +506,6 @@ def positions_view(data, prices_df=None, groups_file=None):
     header = ["Item", "Value/Qty", "Weight", "MV"]
     all_preview_rows = []
 
-    # ---------- 2) Build workbook ----------
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         created_any_sheet = False
@@ -429,7 +518,7 @@ def positions_view(data, prices_df=None, groups_file=None):
                 while sheet_name in writer.book.sheetnames:
                     sheet_name = sanitize_sheet_name(f"{base}-{idx}")
                     idx += 1
-                pd.DataFrame([["Group", grp_name, None, None]], columns=header) \
+                pd.DataFrame([["Group", grp_name, None, None]], columns=header)\
                     .to_excel(writer, index=False, sheet_name=sheet_name)
                 created_any_sheet = True
                 continue
@@ -442,16 +531,14 @@ def positions_view(data, prices_df=None, groups_file=None):
             group_total_mom  = 0.0
             group_stocks_rows = []
 
-            # ----- Build per-client blocks -----
-            for _, r in sub_valid.iterrows():
-                client = r["Name"]
+            for _, rr in sub_valid.iterrows():
+                client = rr["Name"]
                 info   = data[client]
 
                 cash_client = float(info.get("total_cash", 0) or info.get("cash", 0) or 0)
                 mom_client  = float(info.get("momentum_mv", 0) or 0)
                 dfc         = info["data"]
 
-                # Precompute client's MV and detail per stock
                 total_mv_client = 0.0
                 client_stock_rows = []
                 if not dfc.empty:
@@ -461,27 +548,17 @@ def positions_view(data, prices_df=None, groups_file=None):
                         row_price = float(srow.get("Price", 0) or 0)
                         row_mv    = float(srow.get("Market Value", 0) or 0)
 
-                        # effective price
                         eff_price = None
                         if stock in price_map and price_map[stock]:
                             eff_price = float(price_map[stock])
                         elif row_price:
                             eff_price = row_price
 
-                        if eff_price is not None and eff_price != 0:
-                            mv_calc = qty * eff_price
-                        else:
-                            mv_calc = row_mv
-
+                        mv_calc = (qty * eff_price) if (eff_price not in [None, 0]) else row_mv
                         total_mv_client += mv_calc
-                        client_stock_rows.append((stock, qty, eff_price, mv_calc))
 
-                        group_stocks_rows.append({
-                            "Stock": stock,
-                            "Qty": qty,
-                            "Price": eff_price if eff_price is not None else 0.0,
-                            "MV": mv_calc,
-                        })
+                        client_stock_rows.append((stock, qty, eff_price, mv_calc))
+                        group_stocks_rows.append({"Stock": stock, "Qty": qty, "Price": eff_price or 0.0, "MV": mv_calc})
 
                 nav_client = cash_client + total_mv_client + mom_client
 
@@ -489,28 +566,15 @@ def positions_view(data, prices_df=None, groups_file=None):
                 group_total_mv   += total_mv_client
                 group_total_mom  += mom_client
 
-                # ---- Build rows for this client ----
-                # Group row
                 rows.append(["Group", grp_name, None, None])
-
-                # Name row
-                name_idx = len(rows)
                 rows.append(["Name", client, None, None])
-
-                # NAV row
                 nav_idx = len(rows)
                 rows.append(["NAV", nav_client, None, None])
-
-                # Total Cash row
-                total_cash_idx = len(rows)
+                cash_idx = len(rows)
                 rows.append(["Total Cash", cash_client, None, None])
-
-                # Stocks header
-                stocks_header_idx = len(rows)
                 rows.append(["Stocks", "Quantity", "Weight", "MV"])
-
-                # Stocks
                 first_stock_idx = len(rows)
+
                 if client_stock_rows:
                     for stock, qty, eff_price, mv_calc in client_stock_rows:
                         rows.append([stock, qty, None, None])
@@ -518,27 +582,22 @@ def positions_view(data, prices_df=None, groups_file=None):
                 else:
                     last_stock_idx = None
 
-                # Momentum
                 momentum_idx = len(rows)
                 rows.append(["Momentum", mom_client, None, None])
-
-                # Spacer
                 rows.append(["", "", "", ""])
 
                 block_markers.append({
                     "nav_idx": nav_idx,
-                    "total_cash_idx": total_cash_idx,
+                    "cash_idx": cash_idx,
                     "first_stock_idx": first_stock_idx,
                     "last_stock_idx": last_stock_idx,
                     "momentum_idx": momentum_idx,
                 })
 
-            # Preview rows (for dashboard)
             all_preview_rows.extend(rows + [["", "", "", ""]])
 
             grp_df = pd.DataFrame(rows, columns=header)
 
-            # Write sheet
             sheet_name = sanitize_sheet_name(grp_name)
             base, idx = sheet_name, 1
             while sheet_name in writer.book.sheetnames:
@@ -549,118 +608,97 @@ def positions_view(data, prices_df=None, groups_file=None):
             ws = writer.sheets[sheet_name]
             created_any_sheet = True
 
-            # ---------- Group summary data ----------
+            # group summary
             group_total_nav = group_total_cash + group_total_mv + group_total_mom
 
             sum_df = pd.DataFrame(group_stocks_rows)
             if not sum_df.empty:
                 gsum = sum_df.groupby("Stock", as_index=False).agg(
-                    **{
-                        "Sum Qty": ("Qty", "sum"),
-                        "Sum MV":  ("MV", "sum"),
-                    }
+                    **{"Sum Qty": ("Qty", "sum"), "Sum MV": ("MV", "sum")}
                 )
                 gsum["Weight"] = gsum["Sum MV"].div(group_total_nav).fillna(0.0)
-
                 if price_map:
                     gsum["Price"] = gsum["Stock"].map(price_map)
                     gsum["Price"] = gsum.apply(
                         lambda row: row["Price"] if row["Price"] not in [None, 0]
                         else (row["Sum MV"] / row["Sum Qty"] if row["Sum Qty"] else None),
-                        axis=1,
+                        axis=1
                     )
                 else:
-                    gsum["Price"] = gsum.apply(
-                        lambda row: (row["Sum MV"] / row["Sum Qty"]) if row["Sum Qty"] else None,
-                        axis=1,
-                    )
+                    gsum["Price"] = gsum.apply(lambda row: (row["Sum MV"] / row["Sum Qty"]) if row["Sum Qty"] else None, axis=1)
             else:
                 gsum = pd.DataFrame(columns=["Stock", "Sum Qty", "Sum MV", "Weight", "Price"])
 
-            # ---------- Group summary at the BOTTOM (H:...) ----------
             last_data_row = ws.max_row
             summary_start = last_data_row + 2
 
             cash_row    = summary_start + 1
             nav_row     = summary_start + 2
             mv_row      = summary_start + 3
-            cash_mv_row = summary_start + 4  # Cash/MV %
+            cash_mv_row = summary_start + 4
 
             ws.cell(row=summary_start, column=8, value="Group Summary")
 
-            # Total Cash
             ws.cell(row=cash_row, column=8, value="Total Cash")
             cash_val_cell = ws.cell(row=cash_row, column=9, value=group_total_cash)
             cash_val_cell.number_format = "#,##0.00"
 
-            # Total NAV
             ws.cell(row=nav_row, column=8, value="Total NAV")
             nav_val_cell = ws.cell(row=nav_row, column=9, value=group_total_nav)
             nav_val_cell.number_format = "#,##0.00"
 
-            # Total MV
             ws.cell(row=mv_row, column=8, value="Total MV")
             mv_val_cell = ws.cell(row=mv_row, column=9, value=group_total_mv)
             mv_val_cell.number_format = "#,##0.00"
 
-            # Cash / NAV %
             ws.cell(row=cash_row, column=10, value="Cash / NAV %")
             cash_nav_pct = ws.cell(row=cash_row, column=11)
             cash_nav_pct.value = f"=IFERROR({cash_val_cell.coordinate}/{nav_val_cell.coordinate},0)"
             cash_nav_pct.number_format = "0.00%"
 
-            # MV / NAV %
             ws.cell(row=mv_row, column=10, value="MV / NAV %")
             mv_nav_pct = ws.cell(row=mv_row, column=11)
             mv_nav_pct.value = f"=IFERROR({mv_val_cell.coordinate}/{nav_val_cell.coordinate},0)"
             mv_nav_pct.number_format = "0.00%"
 
-            # Cash / MV %
             ws.cell(row=cash_mv_row, column=8, value="Cash / MV %")
             cash_mv_pct = ws.cell(row=cash_mv_row, column=9)
             cash_mv_pct.value = f"=IFERROR({cash_val_cell.coordinate}/{mv_val_cell.coordinate},0)"
             cash_mv_pct.number_format = "0.00%"
 
-            # Per-stock summary table
             sum_header_row = summary_start + 8
             headers_sum = ["Stock", "Sum Qty", "Sum MV", "Weight", "Price"]
             for j, h in enumerate(headers_sum, start=8):
                 ws.cell(row=sum_header_row, column=j, value=h)
 
             for i, row_sum in gsum.iterrows():
-                rr = sum_header_row + 1 + i
-                ws.cell(row=rr, column=8, value=row_sum["Stock"])
-                ws.cell(row=rr, column=9, value=row_sum["Sum Qty"]).number_format = "#,##0"
-                ws.cell(row=rr, column=10, value=row_sum["Sum MV"]).number_format = "#,##0.00"
-                ws.cell(row=rr, column=11, value=row_sum["Weight"]).number_format = "0.00%"
-                ws.cell(row=rr, column=12, value=row_sum["Price"]).number_format = "#,##0.00"
+                rr2 = sum_header_row + 1 + i
+                ws.cell(row=rr2, column=8, value=row_sum["Stock"])
+                ws.cell(row=rr2, column=9, value=row_sum["Sum Qty"]).number_format = "#,##0"
+                ws.cell(row=rr2, column=10, value=row_sum["Sum MV"]).number_format = "#,##0.00"
+                ws.cell(row=rr2, column=11, value=row_sum["Weight"]).number_format = "0.00%"
+                ws.cell(row=rr2, column=12, value=row_sum["Price"]).number_format = "#,##0.00"
 
-            # --- Style summary block (columns H:L) ---
-            # 1) "Group Summary" title row
-            for c in range(8, 13):  # H..L
+            # summary styling
+            for c in range(8, 13):
                 ws.cell(row=summary_start, column=c).fill = STOCKS_HEADER_FILL
-
-            # 2) Metric rows (Total Cash, Total NAV, Total MV, Cash/MV %)
             metric_rows = [cash_row, nav_row, mv_row, cash_mv_row]
-            for idx, r in enumerate(metric_rows):
-                fill = STOCK_WHITE_FILL if idx % 2 == 0 else STOCK_ALT_FILL
-                for c in range(8, 13):  # H..L
+            for idx_m, r in enumerate(metric_rows):
+                fill = STOCK_WHITE_FILL if idx_m % 2 == 0 else STOCK_ALT_FILL
+                for c in range(8, 13):
                     ws.cell(row=r, column=c).fill = fill
-
-            # 3) Per-stock summary header (Stock / Sum Qty / Sum MV / Weight / Price)
-            for c in range(8, 13):  # H..L
+            for c in range(8, 13):
                 ws.cell(row=sum_header_row, column=c).fill = STOCKS_HEADER_FILL
-
-            # 4) Per-stock summary rows (alternate white / light grey)
             if not gsum.empty:
-                alt_fill = True
+                alt = True
                 for i in range(len(gsum)):
-                    rr = sum_header_row + 1 + i
-                    fill = STOCK_WHITE_FILL if alt_fill else STOCK_ALT_FILL
-                    for c in range(8, 13):  # H..L
-                        ws.cell(row=rr, column=c).fill = fill
-                    alt_fill = not alt_fill
+                    rr2 = sum_header_row + 1 + i
+                    fill = STOCK_WHITE_FILL if alt else STOCK_ALT_FILL
+                    for c in range(8, 13):
+                        ws.cell(row=rr2, column=c).fill = fill
+                    alt = not alt
 
+            # price range for formulas
             if not gsum.empty:
                 price_start = sum_header_row + 1
                 price_end   = sum_header_row + len(gsum)
@@ -668,51 +706,38 @@ def positions_view(data, prices_df=None, groups_file=None):
             else:
                 price_range = None
 
-            # ---------- 3) Number formats for main table ----------
-            for cidx in range(2, 5):  # B=Value/Qty, C=Weight, D=MV
+            # formats
+            for cidx in range(2, 5):
                 for r in range(2, ws.max_row + 1):
                     cell = ws.cell(row=r, column=cidx)
                     if isinstance(cell.value, (int, float)):
                         if cidx == 3:
                             cell.number_format = "0.00%"
                         else:
-                            if float(cell.value).is_integer():
-                                cell.number_format = "#,##0"
-                            else:
-                                cell.number_format = "#,##0.00"
+                            cell.number_format = "#,##0" if float(cell.value).is_integer() else "#,##0.00"
 
-            # ---------- 4) Formulas for NAV, MV, Weight ----------
+            # formulas for NAV/MV/WT
             if price_range:
                 for bm in block_markers:
-                    nav_idx          = bm["nav_idx"]
-                    total_cash_idx   = bm["total_cash_idx"]
-                    first_stock_idx  = bm["first_stock_idx"]
-                    last_stock_idx   = bm["last_stock_idx"]
-                    momentum_idx     = bm["momentum_idx"]
+                    nav_row_excel = bm["nav_idx"] + 2
+                    cash_row_excel = bm["cash_idx"] + 2
+                    momentum_row_excel = bm["momentum_idx"] + 2
 
-                    excel_nav_row      = nav_idx + 2
-                    excel_cash_row     = total_cash_idx + 2
-                    excel_momentum_row = momentum_idx + 2
+                    nav_cell = ws.cell(row=nav_row_excel, column=2)
+                    cash_cell = ws.cell(row=cash_row_excel, column=2)
+                    momentum_cell = ws.cell(row=momentum_row_excel, column=2)
 
-                    cash_cell     = ws.cell(row=excel_cash_row, column=2)
-                    momentum_cell = ws.cell(row=excel_momentum_row, column=2)
-                    nav_cell      = ws.cell(row=excel_nav_row, column=2)
-
-                    if last_stock_idx is not None:
-                        first_stock_row = first_stock_idx + 2
-                        last_stock_row  = last_stock_idx + 2
+                    if bm["last_stock_idx"] is not None:
+                        first_stock_row = bm["first_stock_idx"] + 2
+                        last_stock_row = bm["last_stock_idx"] + 2
                         sum_mv_expr = f"SUM(D{first_stock_row}:D{last_stock_row})"
-                        nav_cell.value = (
-                            f"={cash_cell.coordinate}+{sum_mv_expr}+{momentum_cell.coordinate}"
-                        )
+                        nav_cell.value = f"={cash_cell.coordinate}+{sum_mv_expr}+{momentum_cell.coordinate}"
                     else:
-                        nav_cell.value = (
-                            f"={cash_cell.coordinate}+{momentum_cell.coordinate}"
-                        )
+                        nav_cell.value = f"={cash_cell.coordinate}+{momentum_cell.coordinate}"
                     nav_cell.number_format = "#,##0.00"
 
-                    if last_stock_idx is not None:
-                        for df_i in range(first_stock_idx, last_stock_idx + 1):
+                    if bm["last_stock_idx"] is not None:
+                        for df_i in range(bm["first_stock_idx"], bm["last_stock_idx"] + 1):
                             excel_row = df_i + 2
                             stock_cell = ws.cell(row=excel_row, column=1)
                             qty_cell   = ws.cell(row=excel_row, column=2)
@@ -724,68 +749,49 @@ def positions_view(data, prices_df=None, groups_file=None):
                                 f'VLOOKUP({stock_cell.coordinate},{price_range},5,FALSE),0)'
                             )
                             mv_cell.number_format = "#,##0.00"
-
-                            wt_cell.value = (
-                                f'=IFERROR({mv_cell.coordinate}/{nav_cell.coordinate},0)'
-                            )
+                            wt_cell.value = f'=IFERROR({mv_cell.coordinate}/{nav_cell.coordinate},0)'
                             wt_cell.number_format = "0.00%"
 
-            # ---------- 5) Styling: match Example.xlsx ----------
-            # Header row (Item | Value/Qty | Weight | MV)
+            # main styling (A:D)
             for c in range(1, 5):
                 ws.cell(row=1, column=c).fill = NAME_BAR_FILL
 
-            # Then data rows
             in_stock_block = False
-            alt_white = True  # start first stock row as white
-
+            alt_white = True
             for r in range(2, ws.max_row + 1):
                 label = (ws.cell(row=r, column=1).value or "").strip().lower()
 
-                if label == "group":
+                if label in ("group", "name"):
                     for c in range(1, 5):
                         ws.cell(row=r, column=c).fill = NAME_BAR_FILL
                     in_stock_block = False
-
-                elif label == "name":
-                    for c in range(1, 5):
-                        ws.cell(row=r, column=c).fill = NAME_BAR_FILL
-                    in_stock_block = False
-
                 elif label == "nav":
                     for c in range(1, 5):
                         ws.cell(row=r, column=c).fill = NAV_GREY_FILL
                     in_stock_block = False
-
                 elif label == "total cash":
                     for c in range(1, 5):
                         ws.cell(row=r, column=c).fill = CASH_WHITE_FILL
                     in_stock_block = False
-
                 elif label == "stocks":
                     for c in range(1, 5):
                         ws.cell(row=r, column=c).fill = STOCKS_HEADER_FILL
                     in_stock_block = True
-                    alt_white = True  # restart alternating with white
-
+                    alt_white = True
                 elif label == "momentum":
                     for c in range(1, 5):
                         ws.cell(row=r, column=c).fill = MOMENTUM_FILL
                     in_stock_block = False
-
-                elif label == "" or label is None:
+                elif label == "":
                     in_stock_block = False
                     continue
-
                 else:
                     if in_stock_block:
                         fill = STOCK_WHITE_FILL if alt_white else STOCK_ALT_FILL
                         for c in range(1, 5):
                             ws.cell(row=r, column=c).fill = fill
                         alt_white = not alt_white
-                    # if not in_stock_block: leave default
 
-        # Fallback if no sheet created
         if not created_any_sheet:
             pd.DataFrame(
                 [["No data", "No matching clients in groups file"]],
@@ -800,7 +806,6 @@ def positions_view(data, prices_df=None, groups_file=None):
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-    # ---------- Streamlit preview (mimics Excel rows) ----------
     if all_preview_rows:
         preview_df = pd.DataFrame(all_preview_rows, columns=header)
         st.caption("Preview (structure matches Excel sheets):")
@@ -808,20 +813,39 @@ def positions_view(data, prices_df=None, groups_file=None):
     else:
         st.info("No rows to preview.")
 
+
 # -------------------------------------------------
-# Main
+# Main App
 # -------------------------------------------------
 uploaded = st.file_uploader("Upload main Excel (.xlsx)", type=["xlsx"])
 
+groups_file = st.file_uploader(
+    "Optional: Upload Groups mapping (Sequence, Groups, Name)",
+    type=["xlsx", "csv"],
+    key="groups_mapping_top"
+)
+
+cashflow_file = st.file_uploader(
+    "Optional: Upload Cashflow file (.xls)",
+    type=["xls"],
+    key="cashflow_xls"
+)
+
+cashflows_by_client = {}
+if cashflow_file is not None:
+    try:
+        cashflows_by_client = load_cashflows_xls(cashflow_file)
+        st.success("Cashflow file loaded.")
+    except Exception as e:
+        st.error(
+            "Could not read the .xls cashflow file. "
+            "This usually means xlrd is missing. Try: pip install xlrd\n\n"
+            f"Details: {e}"
+        )
+        cashflows_by_client = {}
+
 if uploaded:
     data, prices_df = extract_client_data(uploaded)
-
-    # Groups mapping uploader (top-level, not inside positions_view)
-    groups_file = st.file_uploader(
-        "Optional: Upload Groups mapping (Sequence, Groups, Name)",
-        type=["xlsx", "csv"],
-        key="groups_mapping_top"
-    )
 
     view = st.selectbox(
         "Select View",
@@ -835,7 +859,7 @@ if uploaded:
     )
 
     if view == "Client View":
-        client_view(data)
+        client_view(data, cashflows_by_client=cashflows_by_client)
     elif view == "Total Portfolio View":
         total_portfolio_view(data)
     elif view == "Total Portfolio View (Weights)":
@@ -846,6 +870,7 @@ if uploaded:
         positions_view(data, prices_df, groups_file)
 else:
     st.info("Please upload the main Excel file to begin.")
+
 
 
 
