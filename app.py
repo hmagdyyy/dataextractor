@@ -231,7 +231,7 @@ def extract_client_data(file):
                     all_prices[normalize_stock(name_str)] = float(price)
 
                 # ignore IC tickers here
-                if name_up not in ("STK-300", "STK-302") and isinstance(qty, (int, float)):
+                if name_up not in ("STK-300", "STK-302","STK-291") and isinstance(qty, (int, float)):
                     stock_rows.append({
                         "Company Name": normalize_stock(name_str),
                         "Quantity": float(qty or 0),
@@ -253,6 +253,8 @@ def extract_client_data(file):
                 mv = r[7].value if len(r) > 7 else 0
                 if nm == "STK-300":
                     stream_mv = float(mv or 0)
+                if nm == "STK-291":
+                    arope_mv = float(mv or 0)
                 elif nm == "STK-302":
                     momentum_mv = float(mv or 0)
 
@@ -263,7 +265,7 @@ def extract_client_data(file):
                 aum = float(r[2].value or 0)
                 break
 
-        total_cash = cash + dividends + stream_mv
+        total_cash = cash + dividends + stream_mv + arope_mv
 
         df_stocks = pd.DataFrame(
             stock_rows,
