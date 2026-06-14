@@ -253,7 +253,7 @@ def extract_client_data(file):
                 mv = r[7].value if len(r) > 7 else 0
                 if nm == "STK-300":
                     stream_mv = float(mv or 0)
-                if nm == "STK-291":
+                elif nm == "STK-291":
                     arope_mv = float(mv or 0)
                 elif nm == "STK-302":
                     momentum_mv = float(mv or 0)
