@@ -203,6 +203,7 @@ def extract_client_data(file):
         stock_rows = []
         stream_mv = 0.0
         momentum_mv = 0.0
+        arope_mv = 0.0
         last_stock_row = None
 
         if start_row:
@@ -277,6 +278,7 @@ def extract_client_data(file):
             "cash": cash,
             "dividends": dividends,
             "stream_mv": stream_mv,
+            "arope_mv": arope_mv,
             "momentum_mv": momentum_mv,
             "total_cash": total_cash,
             "aum": aum,
@@ -339,7 +341,7 @@ def total_portfolio_view(data):
         fees = float(info.get("fees_under_payment", 0.0) or 0.0)
         net_cash = raw_cash - fees
 
-        total_cash_view = net_cash + float(info["dividends"]) + float(info["stream_mv"])
+        total_cash_view = net_cash + float(info["dividends"]) + float(info["stream_mv"]) + float(info["arope_mv"])
 
         row = {
             "Client": client,
