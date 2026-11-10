@@ -169,7 +169,7 @@ def extract_client_data(file):
       - Dividends: C32
       - Fees Under Payment: Cxx where Bxx = 'Fees Under Payment'
       - Stocks: B=Name, C=Qty, D=Cost, E=Price, H=MV, I=Weight
-      - ICs: scan next <=10 rows after stocks end for Stk-300 (Stream MV) & Stk-302 (Momentum MV)
+      - ICs: scan next <=10 rows after stocks end for Stk-300 (Stream MV), Stk-302 (Momentum MV) & Stk-316 (EGX30 MV)
       - AUM: 'Total Assets' row (col C)
       - Total Cash (legacy): Cash + Dividends + Stream(MV)
       - Prices table
@@ -203,6 +203,7 @@ def extract_client_data(file):
         stock_rows = []
         stream_mv = 0.0
         momentum_mv = 0.0
+        egx30_mv = 0.0
         arope_mv = 0.0
         last_stock_row = None
 
@@ -232,7 +233,7 @@ def extract_client_data(file):
                     all_prices[normalize_stock(name_str)] = float(price)
 
                 # ignore IC tickers here
-                if name_up not in ("STK-300", "STK-302","STK-291") and isinstance(qty, (int, float)):
+                if name_up not in ("STK-300", "STK-302", "STK-291", "STK-316") and isinstance(qty, (int, float)):
                     stock_rows.append({
                         "Company Name": normalize_stock(name_str),
                         "Quantity": float(qty or 0),
@@ -258,6 +259,8 @@ def extract_client_data(file):
                     arope_mv = float(mv or 0)
                 elif nm == "STK-302":
                     momentum_mv = float(mv or 0)
+                elif nm == "STK-316":
+                    egx30_mv = float(mv or 0)
 
         # AUM
         aum = 0.0
@@ -280,6 +283,7 @@ def extract_client_data(file):
             "stream_mv": stream_mv,
             "arope_mv": arope_mv,
             "momentum_mv": momentum_mv,
+            "egx30_mv": egx30_mv,
             "total_cash": total_cash,
             "aum": aum,
             "fees_under_payment": fees_under_payment,
@@ -301,12 +305,13 @@ def client_view(data, cashflows_by_client=None):
 
     st.subheader(client)
 
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Cash (C27)", f"{info['cash']:,.2f}")
     c2.metric("Dividends (C32)", f"{info['dividends']:,.2f}")
     c3.metric("Stream (Stk-300)", f"{info['stream_mv']:,.2f}")
     c4.metric("Momentum (Stk-302)", f"{info['momentum_mv']:,.2f}")
-    c5.metric("Total Cash", f"{info['total_cash']:,.2f}")
+    c5.metric("EGX30 (Stk-316)", f"{info['egx30_mv']:,.2f}")
+    c6.metric("Total Cash", f"{info['total_cash']:,.2f}")
 
     st.metric("AUM", f"{info['aum']:,.2f}")
 
@@ -350,6 +355,7 @@ def total_portfolio_view(data):
             "Dividends": info["dividends"],
             "Stream": info["stream_mv"],
             "Momentum": info["momentum_mv"],
+            "EGX30": info.get("egx30_mv", 0.0),
             "Total Cash": total_cash_view,
             "NAV": info["aum"],
         }
@@ -365,7 +371,7 @@ def total_portfolio_view(data):
 
         rows.append(row)
 
-    fixed = ["Client", "Cash", "Fees Under Payment", "Dividends", "Stream", "Momentum", "Total Cash"]
+    fixed = ["Client", "Cash", "Fees Under Payment", "Dividends", "Stream", "Momentum", "EGX30", "Total Cash"]
     stock_cols = []
     for s in all_stocks:
         stock_cols += [f"{s} Qty", f"{s} Cost"]
@@ -533,6 +539,7 @@ def positions_view(data, prices_df=None, groups_file=None):
             group_total_cash = 0.0
             group_total_mv   = 0.0
             group_total_mom  = 0.0
+            group_total_egx30 = 0.0
             group_stocks_rows = []
 
             for _, rr in sub_valid.iterrows():
@@ -541,6 +548,7 @@ def positions_view(data, prices_df=None, groups_file=None):
 
                 cash_client = float(info.get("total_cash", 0) or info.get("cash", 0) or 0)
                 mom_client  = float(info.get("momentum_mv", 0) or 0)
+                egx30_client = float(info.get("egx30_mv", 0) or 0)
                 dfc         = info["data"]
 
                 total_mv_client = 0.0
@@ -564,11 +572,12 @@ def positions_view(data, prices_df=None, groups_file=None):
                         client_stock_rows.append((stock, qty, eff_price, mv_calc))
                         group_stocks_rows.append({"Stock": stock, "Qty": qty, "Price": eff_price or 0.0, "MV": mv_calc})
 
-                nav_client = cash_client + total_mv_client + mom_client
+                nav_client = cash_client + total_mv_client + mom_client + egx30_client
 
                 group_total_cash += cash_client
                 group_total_mv   += total_mv_client
                 group_total_mom  += mom_client
+                group_total_egx30 += egx30_client
 
                 rows.append(["Group", grp_name, None, None])
                 rows.append(["Name", client, None, None])
@@ -588,6 +597,8 @@ def positions_view(data, prices_df=None, groups_file=None):
 
                 momentum_idx = len(rows)
                 rows.append(["Momentum", mom_client, None, None])
+                egx30_idx = len(rows)
+                rows.append(["EGX30", egx30_client, None, None])
                 rows.append(["", "", "", ""])
 
                 block_markers.append({
@@ -596,6 +607,7 @@ def positions_view(data, prices_df=None, groups_file=None):
                     "first_stock_idx": first_stock_idx,
                     "last_stock_idx": last_stock_idx,
                     "momentum_idx": momentum_idx,
+                    "egx30_idx": egx30_idx,
                 })
 
             all_preview_rows.extend(rows + [["", "", "", ""]])
@@ -613,7 +625,7 @@ def positions_view(data, prices_df=None, groups_file=None):
             created_any_sheet = True
 
             # group summary
-            group_total_nav = group_total_cash + group_total_mv + group_total_mom
+            group_total_nav = group_total_cash + group_total_mv + group_total_mom + group_total_egx30
 
             sum_df = pd.DataFrame(group_stocks_rows)
             if not sum_df.empty:
@@ -730,14 +742,15 @@ def positions_view(data, prices_df=None, groups_file=None):
                     nav_cell = ws.cell(row=nav_row_excel, column=2)
                     cash_cell = ws.cell(row=cash_row_excel, column=2)
                     momentum_cell = ws.cell(row=momentum_row_excel, column=2)
+                    egx30_cell = ws.cell(row=bm["egx30_idx"] + 2, column=2)
 
                     if bm["last_stock_idx"] is not None:
                         first_stock_row = bm["first_stock_idx"] + 2
                         last_stock_row = bm["last_stock_idx"] + 2
                         sum_mv_expr = f"SUM(D{first_stock_row}:D{last_stock_row})"
-                        nav_cell.value = f"={cash_cell.coordinate}+{sum_mv_expr}+{momentum_cell.coordinate}"
+                        nav_cell.value = f"={cash_cell.coordinate}+{sum_mv_expr}+{momentum_cell.coordinate}+{egx30_cell.coordinate}"
                     else:
-                        nav_cell.value = f"={cash_cell.coordinate}+{momentum_cell.coordinate}"
+                        nav_cell.value = f"={cash_cell.coordinate}+{momentum_cell.coordinate}+{egx30_cell.coordinate}"
                     nav_cell.number_format = "#,##0.00"
 
                     if bm["last_stock_idx"] is not None:
@@ -782,7 +795,7 @@ def positions_view(data, prices_df=None, groups_file=None):
                         ws.cell(row=r, column=c).fill = STOCKS_HEADER_FILL
                     in_stock_block = True
                     alt_white = True
-                elif label == "momentum":
+                elif label in ("momentum", "egx30"):
                     for c in range(1, 5):
                         ws.cell(row=r, column=c).fill = MOMENTUM_FILL
                     in_stock_block = False
