@@ -169,7 +169,7 @@ def extract_client_data(file):
       - Dividends: C32
       - Fees Under Payment: Cxx where Bxx = 'Fees Under Payment'
       - Stocks: B=Name, C=Qty, D=Cost, E=Price, H=MV, I=Weight
-      - ICs: scan next <=10 rows after stocks end for Stk-300 (Stream MV), Stk-302 (Momentum MV) & Stk-316 (EGX30 MV)
+      - ICs: scan from stocks start through 30 rows after stocks end for Stk-300 (Stream MV), Stk-302 (Momentum MV) & Stk-316 (EGX30 MV)
       - AUM: 'Total Assets' row (col C)
       - Total Cash (legacy): Cash + Dividends + Stream(MV)
       - Prices table
@@ -243,24 +243,29 @@ def extract_client_data(file):
                         "Weight": wt or 0,
                     })
 
-            # Scan <=10 rows after stocks for ICs
+            # Scan for ICs: from start of stocks through 30 rows after the grey end row
+            IC_SCAN_EXTRA_ROWS = 30
             if not last_stock_row:
                 last_stock_row = start_row
-            ic_start, ic_end = last_stock_row + 1, last_stock_row + 11
+            ic_start, ic_end = start_row, last_stock_row + IC_SCAN_EXTRA_ROWS
             for r in ws.iter_rows(min_row=ic_start, max_row=ic_end):
                 name_cell = r[1].value
                 if not name_cell:
                     continue
-                nm = str(name_cell).strip().upper()
-                mv = r[7].value if len(r) > 7 else 0
+                nm = re.sub(r"\s+", "", str(name_cell)).upper()  # "STK 316" -> "STK316"
+                nm = nm.replace("STK", "STK-").replace("STK--", "STK-")  # normalise to "STK-316"
+                try:
+                    mv = float((r[7].value if len(r) > 7 else 0) or 0)
+                except (TypeError, ValueError):
+                    mv = 0.0
                 if nm == "STK-300":
-                    stream_mv = float(mv or 0)
+                    stream_mv += mv
                 elif nm == "STK-291":
-                    arope_mv = float(mv or 0)
+                    arope_mv += mv
                 elif nm == "STK-302":
-                    momentum_mv = float(mv or 0)
+                    momentum_mv += mv
                 elif nm == "STK-316":
-                    egx30_mv = float(mv or 0)
+                    egx30_mv += mv
 
         # AUM
         aum = 0.0
